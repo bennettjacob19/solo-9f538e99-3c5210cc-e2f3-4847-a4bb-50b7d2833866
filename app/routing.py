@@ -1,6 +1,8 @@
-"""Symbolic Linux IPv4 policy-routing engine for the dual-egress precheck API.
+"""Symbolic Linux IPv4 policy-routing engine for the dual-egress tools.
 
-The module is pure stdlib so it can be unit-tested without FastAPI.
+The module is pure stdlib so it can be unit-tested without FastAPI.  It is
+shared by the precheck endpoint (compare two snapshots) and the hop-by-hop
+troubleshooting module (follow traffic across two routers).
 
 Model (everything outside this model is rejected with :class:`UnsupportedInput`):
 
@@ -15,15 +17,18 @@ Model (everything outside this model is rejected with :class:`UnsupportedInput`)
   ``no_route``.
 
 The address space is never enumerated: source/destination CIDRs are split
-symbolically into rectangles on which both snapshots have a constant result,
-so the cost depends on the policy size, not on the number of addresses.
+symbolically into rectangles on which the policy result is constant, so the
+cost depends on the policy size, not on the number of addresses.  This yields
+both the changed-pair counts of the precheck and the disjoint
+(source CIDR, destination CIDR) segments of a troubleshooting report.
 """
 from __future__ import annotations
 
 import ipaddress
 import json
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from types import MappingProxyType
+from typing import Any, Mapping, Optional, Sequence, Union
 
 
 class UnsupportedInput(ValueError):
@@ -172,6 +177,34 @@ class Route:
     gateway: Optional[str]
 
 
+@dataclass(frozen=True)
+class ParsedPolicy:
+    """One validated, normalized routing snapshot for a single device."""
+
+    rules: tuple[Rule, ...]
+    tables: Mapping[TableKey, tuple[Route, ...]]
+    submitted_rule_count: int
+    submitted_route_count: int
+
+
+def compile_policy(rules_raw: Any, routes_raw: Any, label: str) -> ParsedPolicy:
+    """Validate and freeze one device's ``rules``/``routes`` snapshot.
+
+    Raises :class:`UnsupportedInput` before the caller commits anything, so a
+    rejected correction can never replace a previously accepted snapshot.
+    """
+    rules = parse_rules(rules_raw, label)
+    tables = parse_routes(routes_raw, label)
+    return ParsedPolicy(
+        rules=tuple(rules),
+        tables=MappingProxyType(
+            {table: tuple(routes) for table, routes in tables.items()}
+        ),
+        submitted_rule_count=len(rules_raw),
+        submitted_route_count=len(routes_raw),
+    )
+
+
 def parse_routes(raw: Any, label: str) -> dict[TableKey, list[Route]]:
     """Validate and normalize the JSON array from ``ip -j -4 route show table all``."""
     if not isinstance(raw, list):
@@ -301,8 +334,8 @@ def _no_route_basis() -> dict:
 def _decide_rect(
     src: ipaddress.IPv4Network,
     dst: ipaddress.IPv4Network,
-    rules: list[Rule],
-    tables: dict[TableKey, list[Route]],
+    rules: Sequence[Rule],
+    tables: dict[TableKey, Sequence[Route]],
 ) -> Union[_Const, _Split]:
     """Decide the fate of the whole rectangle ``src`` x ``dst``.
 
@@ -312,7 +345,7 @@ def _decide_rect(
     disjoint / superset / subset, so a rule or route either covers the whole
     rectangle, misses it, or lies strictly inside it (which forces a split).
     """
-    for idx, rule in enumerate(rules):
+    for rule in rules:
         if not src.overlaps(rule.src) or not dst.overlaps(rule.dst):
             continue
         if not src.subnet_of(rule.src):
@@ -321,15 +354,15 @@ def _decide_rect(
             return _Split("dst")  # rule.dst lies strictly inside dst
         # The rule covers the whole rectangle: consult its table.
         best: Optional[Route] = None
-        has_inner = False
+        inner_route: Optional[Route] = None
         for route in tables.get(rule.table, ()):
             if dst.subnet_of(route.prefix):
                 # route.prefix covers the whole rectangle: longest prefix wins
                 if best is None or route.prefix.prefixlen > best.prefix.prefixlen:
                     best = route
-            elif route.prefix.subnet_of(dst):
-                has_inner = True  # more-specific route strictly inside dst
-        if has_inner:
+            elif route.prefix.subnet_of(dst) and inner_route is None:
+                inner_route = route  # more-specific route strictly inside dst
+        if inner_route is not None:
             return _Split("dst")
         if best is None or best.rtype == "throw":
             continue  # no route or throw: keep consulting the next rules
@@ -342,29 +375,90 @@ def _decide_rect(
 MAX_CELLS = 100_000  # safety bound against pathologically fragmented inputs
 
 
+def _cells_message() -> str:
+    return (
+        f"address space is fragmented into more than {MAX_CELLS} decision cells; "
+        "narrow the CIDRs or simplify the policy"
+    )
+
+
 def _enumerate_cells(
     src_net: ipaddress.IPv4Network,
     dst_net: ipaddress.IPv4Network,
-    before: tuple[list[Rule], dict[TableKey, list[Route]]],
-    after: tuple[list[Rule], dict[TableKey, list[Route]]],
+    before: ParsedPolicy,
+    after: ParsedPolicy,
 ) -> list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const, _Const]]:
     """Partition src_net x dst_net into rectangles where both snapshots are constant."""
-    rules_b, tables_b = before
-    rules_a, tables_a = after
+    rules_b, tables_b = before.rules, before.tables
+    rules_a, tables_a = after.rules, after.tables
     cells: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const, _Const]] = []
 
     def rec(s: ipaddress.IPv4Network, d: ipaddress.IPv4Network) -> None:
         if len(cells) >= MAX_CELLS:
-            raise UnsupportedInput(
-                f"address space is fragmented into more than {MAX_CELLS} decision "
-                "cells; narrow the CIDRs or simplify the policy"
-            )
+            raise UnsupportedInput(_cells_message())
         db = _decide_rect(s, d, rules_b, tables_b)
         da = _decide_rect(s, d, rules_a, tables_a)
         if isinstance(db, _Const) and isinstance(da, _Const):
             cells.append((s, d, db, da))
             return
         if any(isinstance(x, _Split) and x.dim == "src" for x in (db, da)):
+            if s.prefixlen == 32:  # pragma: no cover - unreachable by construction
+                raise AssertionError("cannot split a /32 source prefix")
+            left, right = s.subnets()
+            rec(left, d)
+            rec(right, d)
+        else:
+            if d.prefixlen == 32:  # pragma: no cover - unreachable by construction
+                raise AssertionError("cannot split a /32 destination prefix")
+            left, right = d.subnets()
+            rec(s, left)
+            rec(s, right)
+
+    rec(src_net, dst_net)
+    return cells
+
+
+def partition_rectangles(
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+    policies: Mapping[str, ParsedPolicy],
+) -> list[
+    tuple[
+        ipaddress.IPv4Network,
+        ipaddress.IPv4Network,
+        dict[str, tuple[Result, dict]],
+    ]
+]:
+    """Partition ``src_net x dst_net`` into rectangles constant for every policy.
+
+    Each returned rectangle carries, for every policy name, its constant
+    forwarding result and routing basis inside that rectangle.  The rectangles
+    are disjoint and their union is exactly the queried address space; they are
+    produced symbolically, so ``/0 x /0`` costs the same as a small query.
+    """
+    cells: list[
+        tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, dict[str, tuple[Result, dict]]]
+    ] = []
+
+    def rec(s: ipaddress.IPv4Network, d: ipaddress.IPv4Network) -> None:
+        if len(cells) >= MAX_CELLS:
+            raise UnsupportedInput(_cells_message())
+        decisions: dict[str, tuple[Result, dict]] = {}
+        split_src = False
+        split_dst = False
+        for name, policy in policies.items():
+            decision = _decide_rect(s, d, policy.rules, policy.tables)
+            if isinstance(decision, _Split):
+                if decision.dim == "src":
+                    split_src = True
+                else:
+                    split_dst = True
+            else:
+                decisions[name] = (decision.result, decision.basis)
+        if not split_src and not split_dst:
+            cells.append((s, d, decisions))
+            return
+        if split_src:
             if s.prefixlen == 32:  # pragma: no cover - unreachable by construction
                 raise AssertionError("cannot split a /32 source prefix")
             left, right = s.subnets()
@@ -389,25 +483,18 @@ def _addr_count(net: ipaddress.IPv4Network) -> int:
 # public entry point
 # ---------------------------------------------------------------------------
 
-def run_precheck(
-    source_cidr: Any,
-    destination_cidr: Any,
-    before_rules: Any,
-    before_routes: Any,
-    after_rules: Any,
-    after_routes: Any,
-) -> dict:
-    """Compare two routing snapshots over source_cidr x destination_cidr.
+def collect_changes(
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+    before: ParsedPolicy,
+    after: ParsedPolicy,
+) -> tuple[int, int, list[dict]]:
+    """Compare two already-validated snapshots over a rectangle.
 
-    Returns a dict with a summary and one group per (before, after) result
-    combination that actually occurs; only address pairs whose forwarding
-    result changes are reported.
+    Returns ``(total_pairs, changed_pairs, groups)``.  Snapshot compilation is
+    deliberately kept outside this function so a caller that needs to capture
+    an atomic "generation" of several devices can do so before computing.
     """
-    src_net = parse_prefix(source_cidr, "source_cidr")
-    dst_net = parse_prefix(destination_cidr, "destination_cidr")
-    before = (parse_rules(before_rules, "before"), parse_routes(before_routes, "before"))
-    after = (parse_rules(after_rules, "after"), parse_routes(after_routes, "after"))
-
     cells = _enumerate_cells(src_net, dst_net, before, after)
 
     total = _addr_count(src_net) * _addr_count(dst_net)
@@ -438,6 +525,26 @@ def run_precheck(
             [result_json(kv[0][0]), result_json(kv[0][1])], sort_keys=True
         ),
     )
+    return total, changed, [
+        {
+            "before": result_json(key[0]),
+            "after": result_json(key[1]),
+            "count": str(group["count"]),
+            "example": group["example"],
+            "basis_before": group["basis_before"],
+            "basis_after": group["basis_after"],
+        }
+        for key, group in ordered
+    ]
+
+
+def summarize(
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+    total: int,
+    changed: int,
+    groups: list[dict],
+) -> dict:
     return {
         "summary": {
             "source_cidr": str(src_net),
@@ -445,17 +552,30 @@ def run_precheck(
             "total_pairs": str(total),
             "changed_pairs": str(changed),
             "unchanged_pairs": str(total - changed),
-            "group_count": len(ordered),
+            "group_count": len(groups),
         },
-        "groups": [
-            {
-                "before": result_json(key[0]),
-                "after": result_json(key[1]),
-                "count": str(group["count"]),
-                "example": group["example"],
-                "basis_before": group["basis_before"],
-                "basis_after": group["basis_after"],
-            }
-            for key, group in ordered
-        ],
+        "groups": groups,
     }
+
+
+def run_precheck(
+    source_cidr: Any,
+    destination_cidr: Any,
+    before_rules: Any,
+    before_routes: Any,
+    after_rules: Any,
+    after_routes: Any,
+) -> dict:
+    """Compare two routing snapshots over source_cidr x destination_cidr.
+
+    Returns a dict with a summary and one group per (before, after) result
+    combination that actually occurs; only address pairs whose forwarding
+    result changes are reported.
+    """
+    src_net = parse_prefix(source_cidr, "source_cidr")
+    dst_net = parse_prefix(destination_cidr, "destination_cidr")
+    before = compile_policy(before_rules, before_routes, "before")
+    after = compile_policy(after_rules, after_routes, "after")
+
+    total, changed, groups = collect_changes(src_net, dst_net, before, after)
+    return summarize(src_net, dst_net, total, changed, groups)

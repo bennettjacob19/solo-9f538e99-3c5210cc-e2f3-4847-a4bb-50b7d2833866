@@ -118,3 +118,161 @@ class PrecheckResponse(BaseModel):
     groups: list[ChangeGroup] = Field(
         ..., description="Only address pairs whose forwarding result changes"
     )
+
+
+# ---------------------------------------------------------------------------
+# troubleshooting records and hop-by-hop diagnosis
+# ---------------------------------------------------------------------------
+
+class EgressToPeer(BaseModel):
+    dev: str = Field(..., description="Egress interface towards the peer router")
+    gateway: Optional[str] = Field(
+        None,
+        description="Next-hop gateway towards the peer; null for an on-link link",
+    )
+
+
+class DeviceInput(BaseModel):
+    name: str = Field(..., description="Device name used in the report, e.g. `rtr-a`")
+    egress_dev: str = Field(..., description="Interface that leads to the peer")
+    egress_gateway: Optional[str] = Field(
+        ...,
+        description="Next-hop gateway towards the peer. Must be supplied; use "
+        "null only when the peer is reachable on-link over `egress_dev`",
+    )
+
+
+class RecordCreateRequest(BaseModel):
+    name: Optional[str] = Field(None, description="Free-form record label")
+    devices: list[DeviceInput] = Field(
+        ...,
+        description="Exactly the two routers of the dual-egress site "
+        "(a different count is rejected with 400)",
+    )
+    entry_device: str = Field(
+        ..., description="Name of the device the traffic enters (one of `devices`)"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "name": "site-a dual egress, incident 2026-11-22",
+                    "entry_device": "rtr-a",
+                    "devices": [
+                        {"name": "rtr-a", "egress_dev": "eth1",
+                         "egress_gateway": "192.0.2.2"},
+                        {"name": "rtr-b", "egress_dev": "eth0",
+                         "egress_gateway": "192.0.2.1"},
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class SnapshotRequest(BaseModel):
+    rules: list[dict[str, Any]] = Field(
+        ..., description="Parsed JSON array from `ip -j -4 rule show` on this device"
+    )
+    routes: list[dict[str, Any]] = Field(
+        ...,
+        description="Parsed JSON array from `ip -j -4 route show table all` "
+        "on this device",
+    )
+
+
+class DeviceView(BaseModel):
+    name: str
+    entry: bool
+    egress_to_peer: EgressToPeer
+    has_snapshot: bool
+    snapshot_version: Optional[int] = Field(
+        None, description="Record generation at which this snapshot was accepted"
+    )
+    rules_submitted: Optional[int] = None
+    routes_submitted: Optional[int] = None
+
+
+class RecordView(BaseModel):
+    record_id: str
+    name: Optional[str]
+    entry_device: str
+    version: int = Field(
+        ..., description="Record generation; bumped by every accepted snapshot"
+    )
+    created_at: str
+    updated_at: str
+    devices: list[DeviceView]
+
+
+class SnapshotAccepted(BaseModel):
+    record: RecordView
+    device: str
+    snapshot_version: int = Field(
+        ..., description="Generation of the newly accepted snapshot"
+    )
+
+
+class TraceHop(BaseModel):
+    device: str
+    action: str = Field(
+        ...,
+        description="`transit_to_peer`, `exit_pair`, `blackhole`, `no_route` or "
+        "`pending_snapshot`",
+    )
+    result: Optional[RouteResult] = Field(
+        None, description="Forwarding result on this device (null when pending)"
+    )
+    basis: Optional[dict[str, Any]] = Field(
+        None, description="Rule/table/prefix that produced the result"
+    )
+    snapshot_version: Optional[int] = Field(
+        None, description="Version of the snapshot used on this hop"
+    )
+    note: str
+
+
+class TraceSegment(BaseModel):
+    source_cidr: str
+    destination_cidr: str
+    address_pairs: str = Field(..., description="Number of pairs, decimal string")
+    example: ExamplePair
+    conclusion: str = Field(
+        ...,
+        description="`left_devices`, `blackhole`, `no_route`, `loop` or "
+        "`pending_snapshot`",
+    )
+    terminal_device: str
+    detail: str
+    hops: list[TraceHop]
+
+
+class QueryPair(BaseModel):
+    source_cidr: str
+    destination_cidr: str
+
+
+class ReportSummary(BaseModel):
+    source_cidr: str
+    destination_cidr: str
+    total_pairs: str
+    covered_pairs: str
+    segment_count: int
+    conclusions: dict[str, str] = Field(
+        ..., description="Address pairs per conclusion (only non-zero entries)"
+    )
+
+
+class DiagnoseReport(BaseModel):
+    record_id: str
+    name: Optional[str]
+    version: int = Field(
+        ..., description="Generation of the captured record; the whole report "
+        "comes from this version"
+    )
+    entry_device: str
+    query: QueryPair
+    devices: list[DeviceView]
+    summary: ReportSummary
+    segments: list[TraceSegment]
